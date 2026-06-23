@@ -107,6 +107,15 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
   );
   const [elapsed, setElapsed] = useState(0);
   const [, bumpAliasTick] = useState(0);
+  const [betAmount, setBetAmount] = useState(0);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [chatOpen, setChatOpen] = useState(false);
+  const [chatInput, setChatInput] = useState("");
+  const [chatMessages, setChatMessages] = useState<Array<{ alias: string; text: string; senderColor: string }>>([]);
+  const [newMessagesCount, setNewMessagesCount] = useState(0);
+  const [seatEmotes, setSeatEmotes] = useState<Record<number, string>>({});
+  const wsRef = useRef<WebSocket | null>(null);
+  const chatScrollRef = useRef<HTMLDivElement>(null);
   const autoStreetRef = useRef<string>("");
   const inferredModeRef = useRef(false);
   const streetLogRef = useRef<{ handNumber: number; streets: { street: Street; pot: number; boardCards: number[] }[] }>({
@@ -454,6 +463,216 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
     lobby,
   });
 
+  // Keyboard shortcuts listener
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement;
+      if (
+        target.tagName === "INPUT" ||
+        target.tagName === "TEXTAREA" ||
+        target.isContentEditable
+      ) {
+        return;
+      }
+
+      if (e.key === "?" || e.key === "/") {
+        e.preventDefault();
+        setShortcutsOpen((prev) => !prev);
+        return;
+      }
+
+      const disabled = !isMyTurn || loading;
+      if (disabled) return;
+
+      const activeBetting = ["preflop", "flop", "turn", "river"].includes(game.phase);
+      if (!activeBetting) return;
+
+      const callAmount = Math.max(displayCurrentBet - displayMyBet, 0);
+      const minBet = Math.max(displayCurrentBet * 2, 1);
+
+      switch (e.key.toLowerCase()) {
+        case "f":
+          e.preventDefault();
+          handleAction("fold");
+          break;
+        case "c":
+          if (callAmount === 0) {
+            e.preventDefault();
+            handleAction("check");
+          }
+          break;
+        case "b":
+          e.preventDefault();
+          if (callAmount > 0) {
+            handleAction("call", callAmount);
+          } else {
+            handleAction("bet", betAmount || minBet);
+          }
+          break;
+        case "r":
+          if (displayCurrentBet > 0 && displayMyStack > callAmount) {
+            e.preventDefault();
+            handleAction("raise", betAmount || minBet);
+          }
+          break;
+        case "a":
+          if (displayMyStack > 0) {
+            e.preventDefault();
+            handleAction("allin", displayMyStack);
+          }
+          break;
+        case "1":
+        case "2":
+        case "3":
+        case "4":
+        case "5":
+          e.preventDefault();
+          if (displayMyStack > callAmount) {
+            const pot = displayPot;
+            let sizeMultiplier = 0.5;
+            if (e.key === "2") sizeMultiplier = 2/3;
+            else if (e.key === "3") sizeMultiplier = 0.75;
+            else if (e.key === "4") sizeMultiplier = 1.0;
+            else if (e.key === "5") sizeMultiplier = 2.0;
+
+            const calculated = Math.floor(pot * sizeMultiplier);
+            const clamped = Math.max(minBet, Math.min(calculated, displayMyStack));
+            setBetAmount(clamped);
+          }
+          break;
+        default:
+          break;
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [
+    isMyTurn,
+    loading,
+    game.phase,
+    displayCurrentBet,
+    displayMyBet,
+    displayMyStack,
+    displayPot,
+    betAmount,
+    handleAction,
+  ]);
+
+  const EMOTES = ["😃", "😢", "😠", "😎", "🤔", "🎉"];
+
+  useEffect(() => {
+    if (chatScrollRef.current) {
+      chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
+    }
+  }, [chatMessages, chatOpen]);
+
+  useEffect(() => {
+    let active = true;
+    let ws: WebSocket | null = null;
+    let reconnectTimeout: NodeJS.Timeout;
+
+    const connect = () => {
+      if (!active) return;
+      const base = api.COORDINATOR_API_BASE;
+      const wsBase = base.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
+      const wsUrl = `${wsBase}/api/table/${tableId}/chat/ws`;
+
+      ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data) as {
+            seat_index: number;
+            alias: string;
+            text?: string;
+            emote?: string;
+          };
+
+          if (data.text) {
+            const colors = ["#ff6b6b", "#4dabf7", "#51cf66", "#fcc419", "#cc5de8", "#20c997"];
+            const senderColor = colors[data.seat_index % colors.length];
+            setChatMessages((prev) => [
+              ...prev,
+              { alias: data.alias, text: data.text || "", senderColor },
+            ]);
+            if (!chatOpen) {
+              setNewMessagesCount((c) => c + 1);
+            }
+          }
+
+          if (data.emote) {
+            setSeatEmotes((prev) => ({ ...prev, [data.seat_index]: data.emote || "" }));
+            setTimeout(() => {
+              setSeatEmotes((prev) => {
+                const copy = { ...prev };
+                delete copy[data.seat_index];
+                return copy;
+              });
+            }, 3000);
+          }
+        } catch {
+          // Ignore parse errors
+        }
+      };
+
+      ws.onclose = () => {
+        if (active) {
+          reconnectTimeout = setTimeout(connect, 3000);
+        }
+      };
+
+      ws.onerror = () => {
+        ws?.close();
+      };
+    };
+
+    connect();
+
+    return () => {
+      active = false;
+      clearTimeout(reconnectTimeout);
+      ws?.close();
+    };
+  }, [tableId, chatOpen]);
+
+  const sendChatMessage = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!chatInput.trim() || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    const mySeat = userPlayer ? userPlayer.seat : 0;
+    const myAlias = userAddress ? (getAlias(userAddress) || `Seat ${mySeat}`) : `Seat ${mySeat}`;
+
+    const payload = {
+      seat_index: mySeat,
+      alias: myAlias,
+      text: chatInput.trim(),
+    };
+
+    wsRef.current.send(JSON.stringify(payload));
+    setChatInput("");
+  };
+
+  const sendEmote = (emote: string) => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    const mySeat = userPlayer ? userPlayer.seat : 0;
+    const myAlias = userAddress ? (getAlias(userAddress) || `Seat ${mySeat}`) : `Seat ${mySeat}`;
+
+    const payload = {
+      seat_index: mySeat,
+      alias: myAlias,
+      emote,
+    };
+
+    wsRef.current.send(JSON.stringify(payload));
+  };
+
   return (
     <PixelWorld>
       <div className="min-h-screen flex flex-col items-center gap-4 p-4 pt-6 relative z-[10]">
@@ -484,7 +703,7 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
             <GameBoyButton onClick={() => setGameboyOpen(true)} />
             <button
               onClick={() => setHistoryOpen(true)}
-              className="text-[9px]"
+              className="text-[9px] mr-2"
               style={{
                 background: "none",
                 border: "none",
@@ -496,6 +715,21 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
               title="Hand History"
             >
               HISTORY
+            </button>
+            <button
+              onClick={() => setShortcutsOpen(true)}
+              className="text-[9px]"
+              style={{
+                background: "none",
+                border: "none",
+                color: "#ffc078",
+                textDecoration: "underline",
+                cursor: "pointer",
+                padding: 0,
+              }}
+              title="Keyboard Shortcuts"
+            >
+              KEYS [?]
             </button>
           </div>
 
@@ -643,6 +877,7 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
                     isBot={playMode === "single"}
                     alias={getAlias(player.address) ?? undefined}
                     hideChipStats={false}
+                    activeEmote={seatEmotes[player.seat]}
                   />
                 ))}
 
@@ -700,6 +935,8 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
                   statusHint={seatStatusHint}
                   loading={loading}
                   isSolo={playMode === "single"}
+                  betAmount={betAmount}
+                  setBetAmount={setBetAmount}
                 />
               </div>
             </div>
@@ -725,6 +962,7 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
                     }
                   }}
                   hideChipStats={false}
+                  activeEmote={seatEmotes[userPlayer.seat]}
                 />
               ) : (
                 <div className="flex flex-col items-center gap-2" style={{ opacity: 0.25 }}>
@@ -798,6 +1036,135 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
         onClose={() => setHistoryOpen(false)}
         entries={historyEntries}
       />
+
+      {shortcutsOpen && (
+        <div
+          className="fixed inset-0 bg-black/60 flex items-center justify-center z-[1000] p-4"
+          onClick={() => setShortcutsOpen(false)}
+        >
+          <div
+            className="pixel-border max-w-sm w-full p-6 text-left relative"
+            style={{ background: "#1a120c" }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              onClick={() => setShortcutsOpen(false)}
+              className="absolute top-3 right-3 text-[12px]"
+              style={{ background: "none", border: "none", color: "#f5e6c8", cursor: "pointer" }}
+            >
+              ✕
+            </button>
+            <h2 className="text-[11px] mb-4 text-[#f1c40f] text-center" style={{ fontFamily: "'Press Start 2P', monospace" }}>KEYBOARD SHORTCUTS</h2>
+            <div className="flex flex-col gap-3 text-[8px] leading-relaxed" style={{ fontFamily: "'Press Start 2P', monospace" }}>
+              <div className="flex justify-between border-b border-gray-800 pb-1">
+                <span>[F]</span> <span style={{ color: "#bdc3c7" }}>Fold</span>
+              </div>
+              <div className="flex justify-between border-b border-gray-800 pb-1">
+                <span>[C]</span> <span style={{ color: "#bdc3c7" }}>Check</span>
+              </div>
+              <div className="flex justify-between border-b border-gray-800 pb-1">
+                <span>[B]</span> <span style={{ color: "#bdc3c7" }}>Bet / Call</span>
+              </div>
+              <div className="flex justify-between border-b border-gray-800 pb-1">
+                <span>[R]</span> <span style={{ color: "#bdc3c7" }}>Raise</span>
+              </div>
+              <div className="flex justify-between border-b border-gray-800 pb-1">
+                <span>[A]</span> <span style={{ color: "#bdc3c7" }}>All-in</span>
+              </div>
+              <div className="flex justify-between border-b border-gray-800 pb-1">
+                <span>[1] - [5]</span> <span style={{ color: "#bdc3c7" }}>Quick Bet: 1/2, 2/3, 3/4, pot, 2x pot</span>
+              </div>
+              <div className="flex justify-between border-b border-gray-800 pb-1">
+                <span>[?]</span> <span style={{ color: "#bdc3c7" }}>Toggle Help Overlay</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Chat Overlay Toggle Button */}
+      <button
+        onClick={() => {
+          setChatOpen((prev) => !prev);
+          setNewMessagesCount(0);
+        }}
+        className="pixel-btn pixel-btn-blue text-[9px] fixed bottom-4 right-4 z-40"
+        style={{ padding: "8px 12px" }}
+      >
+        CHAT {newMessagesCount > 0 ? `(${newMessagesCount})` : ""}
+      </button>
+
+      {/* Floating Chat Drawer */}
+      {chatOpen && (
+        <div
+          className="pixel-border-thin fixed bottom-16 right-4 z-40 flex flex-col w-72 h-64 p-3 gap-2"
+          style={{
+            background: "rgba(20, 12, 8, 0.95)",
+            borderColor: "var(--ui-border)",
+          }}
+        >
+          <div className="flex justify-between items-center border-b border-gray-800 pb-1" style={{ fontFamily: "'Press Start 2P', monospace" }}>
+            <span className="text-[9px] text-[#f1c40f]">TABLE CHAT</span>
+            <button
+              onClick={() => setChatOpen(false)}
+              className="text-[9px] text-[#95a5a6]"
+              style={{ background: "none", border: "none", cursor: "pointer" }}
+            >
+              [X]
+            </button>
+          </div>
+          
+          {/* Messages list */}
+          <div
+            ref={chatScrollRef}
+            className="flex-1 overflow-y-auto flex flex-col gap-2 text-[8px] text-left p-1"
+            style={{ scrollbarWidth: "thin", fontFamily: "'Press Start 2P', monospace", maxHeight: "140px" }}
+          >
+            {chatMessages.length === 0 ? (
+              <div className="text-gray-600 text-center mt-8 italic" style={{ fontSize: "8px" }}>No messages yet.</div>
+            ) : (
+              chatMessages.map((msg, idx) => (
+                <div key={idx} className="leading-relaxed">
+                  <span style={{ color: msg.senderColor }}>{msg.alias}: </span>
+                  <span className="text-white">{msg.text}</span>
+                </div>
+              ))
+            )}
+          </div>
+          
+          {/* 6 Quick Emotes */}
+          <div className="flex justify-between items-center gap-1 mt-1 border-t border-gray-900 pt-2">
+            {EMOTES.map((emote, idx) => (
+              <button
+                key={idx}
+                onClick={() => sendEmote(emote)}
+                className="hover:scale-110 transition-transform p-1 text-[14px]"
+                style={{ background: "none", border: "none", cursor: "pointer" }}
+              >
+                {emote}
+              </button>
+            ))}
+          </div>
+          
+          {/* Input row */}
+          <form onSubmit={sendChatMessage} className="flex gap-1 mt-1">
+            <input
+              type="text"
+              value={chatInput}
+              onChange={(e) => setChatInput(e.target.value)}
+              placeholder="Say something..."
+              className="flex-1 px-2 py-1 text-[8px]"
+            />
+            <button
+              type="submit"
+              className="pixel-btn pixel-btn-green text-[8px]"
+              style={{ padding: "4px 8px" }}
+            >
+              SEND
+            </button>
+          </form>
+        </div>
+      )}
     </PixelWorld>
   );
 }

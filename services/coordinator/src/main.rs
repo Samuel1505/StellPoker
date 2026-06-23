@@ -17,17 +17,71 @@ use axum::{
     middleware,
     routing::{get, post},
     Router,
+    extract::State,
+    Json,
+    middleware::Next,
+    response::Response,
+    http::Request,
+    body::Body,
 };
+use axum::extract::ws::{WebSocketUpgrade, WebSocket, Message};
+use futures::{StreamExt, SinkExt};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Instant, SystemTime};
+use tokio::sync::{RwLock, Mutex};
 use tower_http::cors::CorsLayer;
+use serde::Serialize;
 
 mod api;
 mod middleware as request_log;
 mod mpc;
 mod session_gc;
 mod soroban;
+
+#[derive(Serialize, Clone, Debug)]
+pub struct LatencyHistogram {
+    pub under_50ms: u64,
+    pub under_250ms: u64,
+    pub under_1000ms: u64,
+    pub under_5000ms: u64,
+    pub over_5000ms: u64,
+}
+
+impl Default for LatencyHistogram {
+    fn default() -> Self {
+        Self {
+            under_50ms: 0,
+            under_250ms: 0,
+            under_1000ms: 0,
+            under_5000ms: 0,
+            over_5000ms: 0,
+        }
+    }
+}
+
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct RouteMetric {
+    pub count: u64,
+    pub errors: u64,
+    pub latency_histogram: LatencyHistogram,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct MpcNodeHealth {
+    pub endpoint: String,
+    pub connected: bool,
+    pub last_heartbeat: Option<SystemTime>,
+}
+
+#[derive(Clone)]
+pub struct MetricsState {
+    pub boot_time: Instant,
+    pub active_mpc_sessions: Arc<AtomicUsize>,
+    pub route_metrics: Arc<Mutex<HashMap<String, RouteMetric>>>,
+    pub node_healths: Arc<Mutex<Vec<MpcNodeHealth>>>,
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -37,6 +91,8 @@ struct AppState {
     soroban_config: soroban::SorobanConfig,
     auth_state: Arc<RwLock<AuthState>>,
     rate_limit_state: Arc<RwLock<RateLimitState>>,
+    metrics: MetricsState,
+    chat_channels: Arc<Mutex<HashMap<u32, tokio::sync::broadcast::Sender<String>>>>,
     mpc_sessions: session_gc::SessionStore,
 }
 
@@ -134,10 +190,25 @@ async fn main() {
         tracing::warn!("Soroban not configured — on-chain submission disabled");
     }
 
+    let initial_node_healths = mpc_config.node_endpoints
+        .iter()
+        .map(|ep| MpcNodeHealth {
+            endpoint: ep.clone(),
+            connected: false,
+            last_heartbeat: None,
+        })
+        .collect::<Vec<_>>();
+
+    let metrics = MetricsState {
+        boot_time: Instant::now(),
+        active_mpc_sessions: Arc::new(AtomicUsize::new(0)),
+        route_metrics: Arc::new(Mutex::new(HashMap::new())),
+        node_healths: Arc::new(Mutex::new(initial_node_healths)),
+    };
+
     let mpc_sessions: session_gc::SessionStore =
         Arc::new(RwLock::new(std::collections::HashMap::new()));
 
-    // Start background GC task for timed-out MPC sessions.
     session_gc::spawn_gc_task(Arc::clone(&mpc_sessions));
 
     let state = AppState {
@@ -147,8 +218,40 @@ async fn main() {
         soroban_config,
         auth_state: Arc::new(RwLock::new(AuthState::default())),
         rate_limit_state: Arc::new(RwLock::new(RateLimitState::default())),
+        metrics: metrics.clone(),
+        chat_channels: Arc::new(Mutex::new(HashMap::new())),
         mpc_sessions,
     };
+
+    // Spawn background node health check task
+    let node_endpoints = state.mpc_config.node_endpoints.clone();
+    let node_healths = state.metrics.node_healths.clone();
+    tokio::spawn(async move {
+        loop {
+            for (idx, endpoint) in node_endpoints.iter().enumerate() {
+                let url = format!("{}/health", endpoint);
+                let is_healthy = reqwest::get(&url)
+                    .await
+                    .map(|r| r.status().is_success())
+                    .unwrap_or(false);
+                
+                let mut guard = node_healths.lock().await;
+                if idx < guard.len() {
+                    let prev_connected = guard[idx].connected;
+                    if is_healthy {
+                        guard[idx].connected = true;
+                        guard[idx].last_heartbeat = Some(SystemTime::now());
+                    } else {
+                        if prev_connected {
+                            tracing::warn!("MPC Node {} ({}) went offline", idx, endpoint);
+                        }
+                        guard[idx].connected = false;
+                    }
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        }
+    });
 
     let app = Router::new()
         .route("/api/health", get(health))
@@ -176,10 +279,10 @@ async fn main() {
         )
         .route("/api/table/:table_id/state", get(api::get_table_state))
         .route("/api/committee/status", get(api::committee_status))
-        // Admin: manual session cancellation (issue #49)
+        .route("/api/table/:table_id/chat/ws", get(chat_ws_handler))
         .route("/api/session/:session_id/cancel", post(api::cancel_mpc_session))
-        // Admin: session status (issue #49)
         .route("/api/session/:session_id/status", get(api::get_mpc_session_status))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), metrics_middleware))
         .layer(middleware::from_fn(request_log::log_request))
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -191,6 +294,192 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn health() -> &'static str {
-    "ok"
+#[derive(Serialize)]
+struct HealthResponse {
+    uptime_seconds: u64,
+    mpc_nodes: Vec<MpcNodeHealth>,
+    soroban_rpc: SorobanHealth,
+    active_mpc_sessions: usize,
+    request_metrics: HashMap<String, RouteMetric>,
+}
+
+#[derive(Serialize)]
+struct SorobanHealth {
+    endpoint: String,
+    status: String,
+}
+
+async fn check_soroban_connectivity(rpc_url: &str) -> bool {
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getLatestLedger"
+    });
+    
+    let resp = client.post(rpc_url).json(&body).send().await;
+    match resp {
+        Ok(r) => r.status().is_success() || r.status() == 200,
+        Err(_) => false,
+    }
+}
+
+async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+    let uptime_seconds = state.metrics.boot_time.elapsed().as_secs();
+    let mpc_nodes = state.metrics.node_healths.lock().await.clone();
+    
+    // Check Soroban RPC connectivity
+    let soroban_status = if check_soroban_connectivity(&state.soroban_config.rpc_url).await {
+        "connected".to_string()
+    } else {
+        tracing::warn!("Soroban RPC connectivity check failed for {}", state.soroban_config.rpc_url);
+        "disconnected".to_string()
+    };
+    
+    // Log health check failures at WARN level
+    for node in &mpc_nodes {
+        if !node.connected {
+            tracing::warn!("Health check warning: MPC Node {} is disconnected", node.endpoint);
+        }
+    }
+    if soroban_status == "disconnected" {
+        tracing::warn!("Health check warning: Soroban RPC is disconnected");
+    }
+    
+    let active_mpc_sessions = state.metrics.active_mpc_sessions.load(Ordering::SeqCst);
+    let request_metrics = state.metrics.route_metrics.lock().await.clone();
+    
+    Json(HealthResponse {
+        uptime_seconds,
+        mpc_nodes,
+        soroban_rpc: SorobanHealth {
+            endpoint: state.soroban_config.rpc_url.clone(),
+            status: soroban_status,
+        },
+        active_mpc_sessions,
+        request_metrics,
+    })
+}
+
+async fn metrics_middleware(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let path = req.uri().path().to_string();
+    let method = req.method().to_string();
+    let route = format!("{} {}", method, path);
+
+    if path == "/api/health" || path.ends_with("/chat/ws") {
+        return next.run(req).await;
+    }
+
+    let start = Instant::now();
+    let response = next.run(req).await;
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    let status = response.status();
+    let is_error = status.is_server_error() || status.is_client_error();
+
+    let mut route_metrics = state.metrics.route_metrics.lock().await;
+    let entry = route_metrics.entry(route).or_default();
+    entry.count += 1;
+    if is_error {
+        entry.errors += 1;
+    }
+    if duration_ms < 50 {
+        entry.latency_histogram.under_50ms += 1;
+    } else if duration_ms < 250 {
+        entry.latency_histogram.under_250ms += 1;
+    } else if duration_ms < 1000 {
+        entry.latency_histogram.under_1000ms += 1;
+    } else if duration_ms < 5000 {
+        entry.latency_histogram.under_5000ms += 1;
+    } else {
+        entry.latency_histogram.over_5000ms += 1;
+    }
+
+    response
+}
+
+fn sanitize_chat_message(input: &str) -> String {
+    let trimmed = input.trim();
+    let limited = if trimmed.len() > 128 {
+        &trimmed[..128]
+    } else {
+        trimmed
+    };
+    limited.replace('<', "&lt;").replace('>', "&gt;")
+}
+
+fn sanitize_alias(input: &str) -> String {
+    let trimmed = input.trim();
+    let limited = if trimmed.len() > 24 {
+        &trimmed[..24]
+    } else {
+        trimmed
+    };
+    limited.replace('<', "&lt;").replace('>', "&gt;")
+}
+
+async fn chat_ws_handler(
+    ws: WebSocketUpgrade,
+    axum::extract::Path(table_id): axum::extract::Path<u32>,
+    State(state): State<AppState>,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_chat_socket(socket, table_id, state))
+}
+
+async fn handle_chat_socket(socket: WebSocket, table_id: u32, state: AppState) {
+    let (mut ws_sender, mut ws_receiver) = socket.split();
+    
+    let tx = {
+        let mut channels = state.chat_channels.lock().await;
+        channels.entry(table_id)
+            .or_insert_with(|| {
+                let (tx, _) = tokio::sync::broadcast::channel(100);
+                tx
+            })
+            .clone()
+    };
+    
+    let mut rx = tx.subscribe();
+    
+    let mut send_task = tokio::spawn(async move {
+        while let Ok(msg_str) = rx.recv().await {
+            if ws_sender.send(Message::Text(msg_str.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+    
+    let mut recv_task = tokio::spawn(async move {
+        while let Some(Ok(msg)) = ws_receiver.next().await {
+            if let Ok(text) = msg.to_text() {
+                if let Ok(mut json_val) = serde_json::from_str::<serde_json::Value>(text) {
+                    if let Some(text_val) = json_val.get_mut("text") {
+                        if let Some(s) = text_val.as_str() {
+                            let sanitized = sanitize_chat_message(s);
+                            *text_val = serde_json::Value::String(sanitized);
+                        }
+                    }
+                    if let Some(alias_val) = json_val.get_mut("alias") {
+                        if let Some(s) = alias_val.as_str() {
+                            let sanitized = sanitize_alias(s);
+                            *alias_val = serde_json::Value::String(sanitized);
+                        }
+                    }
+                    
+                    if let Ok(broadcast_msg) = serde_json::to_string(&json_val) {
+                        let _ = tx.send(broadcast_msg);
+                    }
+                }
+            }
+        }
+    });
+    
+    tokio::select! {
+        _ = &mut send_task => recv_task.abort(),
+        _ = &mut recv_task => send_task.abort(),
+    }
 }

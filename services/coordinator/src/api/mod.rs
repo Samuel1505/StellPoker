@@ -29,6 +29,23 @@ use session::{
 const MAX_PLAYERS: usize = 6;
 const MIN_PLAYERS: usize = 2;
 
+pub struct SessionGuard {
+    counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SessionGuard {
+    pub fn new(counter: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self { counter }
+    }
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// GET /api/chain-config
 ///
 /// Public chain parameters used by the frontend for wallet-signed
@@ -312,6 +329,7 @@ pub async fn request_deal(
     })?;
 
     let proof_session_id = format!("table-{}-deal-{}", table_id, Uuid::new_v4());
+    let _guard = SessionGuard::new(state.metrics.active_mpc_sessions.clone());
     let deal_proof = mpc::generate_proof_from_share_sets(
         table_id,
         &prepared_deal.share_set_ids,
@@ -486,6 +504,7 @@ pub async fn request_reveal(
     })?;
 
     let proof_session_id = next_proof_session_id(session, &format!("reveal-{}", phase));
+    let _guard = SessionGuard::new(state.metrics.active_mpc_sessions.clone());
     let reveal_proof = mpc::generate_proof_from_share_sets(
         table_id,
         &prepared_reveal.share_set_ids,
@@ -636,6 +655,7 @@ pub async fn request_showdown(
     })?;
 
     let proof_session_id = next_proof_session_id(session, "showdown");
+    let _guard = SessionGuard::new(state.metrics.active_mpc_sessions.clone());
     let showdown_proof = mpc::generate_proof_from_share_sets(
         table_id,
         &prepared_showdown.share_set_ids,
