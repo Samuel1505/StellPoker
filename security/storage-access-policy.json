@@ -1,0 +1,135 @@
+{
+  "contracts": {
+    "poker-table": {
+      "path": "contracts/poker-table/src",
+      "key_enums": ["DataKey"],
+      "literal_keys": ["Symbol::next_id"],
+      "sensitive_writes": {
+        "DataKey::Table": {
+          "authorized_functions": [
+            "create_table",
+            "join_table",
+            "leave_table",
+            "start_hand",
+            "commit_deal",
+            "player_action",
+            "reveal_board",
+            "submit_showdown",
+            "claim_timeout",
+            "set_hub",
+            "set_rake_bps",
+            "set_min_players",
+            "withdraw_rake"
+          ],
+          "auth_model": "player_or_committee_or_admin_require_auth",
+          "admin_multisig_required": true
+        },
+        "DataKey::Paused": {
+          "authorized_functions": ["pause", "unpause"],
+          "auth_model": "table_admin_require_auth",
+          "admin_multisig_required": true
+        },
+        "Symbol::next_id": {
+          "authorized_functions": ["create_table"],
+          "auth_model": "creator_admin_require_auth",
+          "admin_multisig_required": true
+        }
+      }
+    },
+    "committee-registry": {
+      "path": "contracts/committee-registry/src",
+      "key_enums": ["RegistryKey"],
+      "literal_keys": [],
+      "sensitive_writes": {
+        "RegistryKey::Admin": {
+          "authorized_functions": ["initialize"],
+          "auth_model": "initial_admin_require_auth",
+          "admin_multisig_required": true
+        },
+        "RegistryKey::StakeToken": {
+          "authorized_functions": ["initialize"],
+          "auth_model": "initial_admin_require_auth",
+          "admin_multisig_required": true
+        },
+        "RegistryKey::MinStake": {
+          "authorized_functions": ["initialize"],
+          "auth_model": "initial_admin_require_auth",
+          "admin_multisig_required": true
+        },
+        "RegistryKey::TimeoutConfig": {
+          "authorized_functions": ["initialize", "set_timeout_config"],
+          "auth_model": "stored_admin_require_auth",
+          "admin_multisig_required": true
+        },
+        "RegistryKey::Game": {
+          "authorized_functions": ["track_game_phase", "report_timeout"],
+          "auth_model": "stored_admin_or_timeout_window",
+          "admin_multisig_required": true
+        },
+        "RegistryKey::Paused": {
+          "authorized_functions": ["pause", "unpause"],
+          "auth_model": "stored_admin_require_auth",
+          "admin_multisig_required": true
+        },
+        "RegistryKey::Member": {
+          "authorized_functions": [
+            "register_member",
+            "deregister_member",
+            "report_timeout",
+            "report_slash"
+          ],
+          "auth_model": "member_require_auth_or_liveness_slash",
+          "admin_multisig_required": false
+        },
+        "RegistryKey::AllMembers": {
+          "authorized_functions": ["register_member"],
+          "auth_model": "member_require_auth",
+          "admin_multisig_required": false
+        },
+        "RegistryKey::Epoch": {
+          "authorized_functions": ["create_epoch"],
+          "auth_model": "stored_admin_require_auth",
+          "admin_multisig_required": true
+        },
+        "RegistryKey::CurrentEpoch": {
+          "authorized_functions": ["create_epoch"],
+          "auth_model": "stored_admin_require_auth",
+          "admin_multisig_required": true
+        }
+      }
+    },
+    "zk-verifier": {
+      "path": "contracts/zk-verifier/src",
+      "key_enums": ["StorageKey"],
+      "literal_keys": [],
+      "sensitive_writes": {
+        "StorageKey::Admin": {
+          "authorized_functions": ["initialize"],
+          "auth_model": "initial_admin_require_auth",
+          "admin_multisig_required": true
+        },
+        "StorageKey::Paused": {
+          "authorized_functions": ["pause", "unpause"],
+          "auth_model": "stored_admin_require_auth",
+          "admin_multisig_required": true
+        },
+        "StorageKey::Vk": {
+          "authorized_functions": ["set_verification_key"],
+          "auth_model": "stored_admin_require_auth",
+          "admin_multisig_required": true
+        },
+        "StorageKey::ProofVerified": {
+          "authorized_functions": ["verify_proof"],
+          "auth_model": "successful_proof_verification",
+          "admin_multisig_required": false
+        }
+      }
+    },
+    "game-hub": {
+      "path": "contracts/game-hub/src",
+      "key_enums": [],
+      "literal_keys": [],
+      "sensitive_writes": {}
+    }
+  }
+}

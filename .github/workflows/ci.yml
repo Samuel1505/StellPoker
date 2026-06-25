@@ -34,6 +34,9 @@ jobs:
       - name: Test poker-table contract
         run: cargo test -p poker-table
 
+      - name: Audit contract storage access
+        run: python3 scripts/audit_storage_access.py
+
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
 

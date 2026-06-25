@@ -60,7 +60,7 @@ impl PluginManifest {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LoadedPlugin {
     pub info: PluginInfo,
     pub module: std::sync::Arc<wasmtime::Module>,

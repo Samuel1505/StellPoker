@@ -1071,7 +1071,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #37)")]
+    #[should_panic(expected = "Error(Contract, #39)")]
     fn test_paused_blocks_join_table() {
         let s = setup();
         let table_id = create_default_table(&s);
@@ -1083,7 +1083,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #37)")]
+    #[should_panic(expected = "Error(Contract, #39)")]
     fn test_paused_blocks_start_hand() {
         let s = setup();
         let table_id = create_default_table(&s);
@@ -1098,7 +1098,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #37)")]
+    #[should_panic(expected = "Error(Contract, #39)")]
     fn test_paused_blocks_player_action() {
         let s = setup();
         let table_id = create_default_table(&s);

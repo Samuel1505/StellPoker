@@ -1,11 +1,11 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use tokio::sync::RwLock;
 use tracing;
-use wasmtime::{Engine, Instance, Linker, Module, Store, TypedFunc};
+use wasmtime::{Engine, Instance, Linker, Module, Store};
 
 use super::sandbox;
 use super::types::{BlindStructure, LoadedPlugin, PluginInfo, PluginManifest};
@@ -21,12 +21,12 @@ fn read_wasm_string(
     len: i32,
 ) -> Result<String, String> {
     let memory = instance
-        .get_memory(store, "memory")
+        .get_memory(&mut *store, "memory")
         .ok_or_else(|| "plugin has no exported memory".to_string())?;
 
     let mut buffer = vec![0u8; len as usize];
     memory
-        .read(store, ptr as usize, &mut buffer)
+        .read(&mut *store, ptr as usize, &mut buffer)
         .map_err(|e| format!("failed to read plugin memory: {}", e))?;
 
     String::from_utf8(buffer).map_err(|e| format!("invalid UTF-8 in plugin string: {}", e))
@@ -38,19 +38,19 @@ fn copy_to_wasm_memory(
     data: &[u8],
 ) -> Result<i32, String> {
     let memory = instance
-        .get_memory(store, "memory")
+        .get_memory(&mut *store, "memory")
         .ok_or_else(|| "plugin has no exported memory".to_string())?;
 
     let alloc = instance
-        .get_typed_func::<(i32,), i32>(store, "alloc")
+        .get_typed_func::<(i32,), i32>(&mut *store, "alloc")
         .map_err(|_| "plugin does not export alloc function".to_string())?;
 
     let ptr = alloc
-        .call(store, data.len() as i32)
+        .call(&mut *store, (data.len() as i32,))
         .map_err(|e| format!("alloc failed: {}", e))?;
 
     memory
-        .write(store, ptr as usize, data)
+        .write(&mut *store, ptr as usize, data)
         .map_err(|e| format!("failed to write plugin memory: {}", e))?;
 
     Ok(ptr)
@@ -76,8 +76,7 @@ impl PluginLoader {
     pub async fn load_plugin_from_path(&self, wasm_path: &Path) -> Result<String, String> {
         let wasm_bytes =
             std::fs::read(wasm_path).map_err(|e| format!("failed to read wasm file: {}", e))?;
-        self.load_plugin_from_bytes(&wasm_bytes, wasm_path)
-            .await
+        self.load_plugin_from_bytes(&wasm_bytes, wasm_path).await
     }
 
     pub async fn load_plugin_from_bytes(
@@ -85,8 +84,8 @@ impl PluginLoader {
         wasm_bytes: &[u8],
         source: &Path,
     ) -> Result<String, String> {
-        let module =
-            Module::new(&self.engine, wasm_bytes).map_err(|e| format!("invalid wasm module: {}", e))?;
+        let module = Module::new(&self.engine, wasm_bytes)
+            .map_err(|e| format!("invalid wasm module: {}", e))?;
 
         let mut linker = Linker::new(&self.engine);
         self.register_host_functions(&mut linker)?;
@@ -190,14 +189,11 @@ impl PluginLoader {
             .get_typed_func::<(i32,), i32>(&mut store, "evaluate_hand")
             .map_err(|_| "plugin does not export evaluate_hand".to_string())?;
 
-        let bytes: Vec<u8> = cards
-            .iter()
-            .flat_map(|c| c.to_le_bytes())
-            .collect();
+        let bytes: Vec<u8> = cards.iter().flat_map(|c| c.to_le_bytes()).collect();
         let ptr = copy_to_wasm_memory(&loaded.instance, &mut store, &bytes)?;
 
         let result = func
-            .call(&mut store, ptr)
+            .call(&mut store, (ptr,))
             .map_err(|e| format!("evaluate_hand call failed: {}", e))?;
 
         Ok(result as u32)
@@ -251,7 +247,7 @@ impl PluginLoader {
             .map_err(|_| "plugin does not export can_raise".to_string())?;
 
         let result = func
-            .call(&mut store, round as i32)
+            .call(&mut store, (round as i32,))
             .map_err(|e| format!("can_raise call failed: {}", e))?;
 
         Ok(result != 0)
@@ -282,11 +278,11 @@ impl PluginLoader {
         store: &mut Store<()>,
     ) -> Result<String, String> {
         let func = instance
-            .get_typed_func::<(), (i32, i32)>(store, "plugin_name")
+            .get_typed_func::<(), (i32, i32)>(&mut *store, "plugin_name")
             .map_err(|_| "plugin does not export plugin_name".to_string())?;
 
         let (ptr, len) = func
-            .call(store, ())
+            .call(&mut *store, ())
             .map_err(|e| format!("plugin_name call failed: {}", e))?;
 
         read_wasm_string(instance, store, ptr, len)
@@ -298,11 +294,11 @@ impl PluginLoader {
         store: &mut Store<()>,
     ) -> Result<String, String> {
         let func = instance
-            .get_typed_func::<(), (i32, i32)>(store, "plugin_version")
+            .get_typed_func::<(), (i32, i32)>(&mut *store, "plugin_version")
             .map_err(|_| "plugin does not export plugin_version".to_string())?;
 
         let (ptr, len) = func
-            .call(store, ())
+            .call(&mut *store, ())
             .map_err(|e| format!("plugin_version call failed: {}", e))?;
 
         read_wasm_string(instance, store, ptr, len)
@@ -341,6 +337,6 @@ mod tests {
     fn test_plugin_loader_creation() {
         let engine = test_engine();
         let loader = PluginLoader::new(engine);
-        assert!(loader.plugins().read().unwrap().is_empty());
+        assert!(loader.plugins().try_read().unwrap().is_empty());
     }
 }

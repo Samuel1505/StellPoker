@@ -2,6 +2,27 @@
 
 This service orchestrates the MPC committee for game proving and card shuffling.
 
+## Hot Reload
+
+Install `cargo-watch` once:
+
+```bash
+cargo install cargo-watch
+```
+
+Run the coordinator with Rust hot reload from the repository root:
+
+```bash
+./scripts/dev-coordinator-watch.sh
+```
+
+The watcher recompiles and restarts `cargo run -p coordinator` when coordinator
+Rust sources, migrations, or Cargo manifests change. During hot reload the
+coordinator writes table sessions and lobby assignments to
+`.tmp/coordinator-hot-reload.json` every few seconds and restores that snapshot
+on restart. Persistent chain state is still rehydrated from Soroban when a
+session is missing from memory.
+
 ## API Endpoints
 
 ### GET `/api/health`

@@ -28,7 +28,7 @@ use futures::{SinkExt, StreamExt};
 use prometheus::{
     Encoder, Gauge, HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -42,6 +42,7 @@ mod audit_log;
 mod cors_db;
 mod db;
 mod feature_flags;
+mod hot_reload;
 mod mpc;
 mod plugin;
 mod rate_limit_db;
@@ -126,13 +127,6 @@ struct AppState {
     db_pool: Option<Arc<sqlx::PgPool>>,
     instance_id: String,
     pub plugin_loader: Arc<tokio::sync::RwLock<plugin::PluginLoader>>,
-    billing_engine: Arc<billing::BillingEngine>,
-
-    stats: stats::StatsStore,
-    feature_flags: feature_flags::FeatureFlagStore,
-    db_pool: Option<Arc<sqlx::PgPool>>,
-    instance_id: String,
-    pub plugin_loader: Arc<tokio::sync::RwLock<plugin::PluginLoader>>,
 }
 
 #[derive(Clone)]
@@ -148,7 +142,7 @@ struct MpcConfig {
     committee_secret: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[allow(dead_code)]
 struct TableSession {
     table_id: u32,
@@ -396,8 +390,8 @@ async fn main() {
         .consume_fuel(true)
         .wasm_multi_value(true)
         .wasm_memory64(false);
-    let plugin_engine = wasmtime::Engine::new(&wasm_config)
-        .expect("failed to create wasmtime engine");
+    let plugin_engine =
+        wasmtime::Engine::new(&wasm_config).expect("failed to create wasmtime engine");
     let plugin_loader = plugin::PluginLoader::new(plugin_engine);
     let plugin_loader = Arc::new(tokio::sync::RwLock::new(plugin_loader));
     {
@@ -410,9 +404,32 @@ async fn main() {
         }
     }
 
+    let hot_reload_snapshot = hot_reload::snapshot_path_from_env();
+    let restored_snapshot = hot_reload_snapshot
+        .as_ref()
+        .and_then(|path| hot_reload::load_snapshot(path));
+    let tables = Arc::new(RwLock::new(
+        restored_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.tables.clone())
+            .unwrap_or_default(),
+    ));
+    let lobby_assignments = Arc::new(RwLock::new(
+        restored_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.lobby_assignments.clone())
+            .unwrap_or_default(),
+    ));
+    if let Some(snapshot) = &restored_snapshot {
+        tracing::info!(
+            "Restored hot-reload snapshot with {} table session(s)",
+            snapshot.tables.len()
+        );
+    }
+
     let state = AppState {
-        tables: Arc::new(RwLock::new(HashMap::new())),
-        lobby_assignments: Arc::new(RwLock::new(HashMap::new())),
+        tables: Arc::clone(&tables),
+        lobby_assignments: Arc::clone(&lobby_assignments),
         mpc_config,
         soroban_config,
         auth_state: Arc::new(RwLock::new(AuthState::default())),
@@ -429,6 +446,10 @@ async fn main() {
         plugin_loader,
     };
 
+    if let Some(path) = hot_reload_snapshot {
+        hot_reload::spawn_snapshot_task(path, tables, lobby_assignments);
+    }
+
     // Spawn background node health check task
     let node_healths = state.metrics.node_healths.clone();
     let soroban_config = state.soroban_config.clone();
@@ -441,7 +462,10 @@ async fn main() {
                 match soroban::fetch_active_nodes_from_registry(&soroban_config).await {
                     Ok(members) => members.into_iter().map(|m| m.endpoint).collect(),
                     Err(e) => {
-                        tracing::warn!("Failed to fetch nodes from registry for health check: {}", e);
+                        tracing::warn!(
+                            "Failed to fetch nodes from registry for health check: {}",
+                            e
+                        );
                         default_endpoints.clone()
                     }
                 }
@@ -471,7 +495,11 @@ async fn main() {
                     guard.push(MpcNodeHealth {
                         endpoint,
                         connected: is_healthy,
-                        last_heartbeat: if is_healthy { Some(SystemTime::now()) } else { None },
+                        last_heartbeat: if is_healthy {
+                            Some(SystemTime::now())
+                        } else {
+                            None
+                        },
                     });
                 }
             }
@@ -490,10 +518,7 @@ async fn main() {
         .route("/api/plugins/health", get(api::plugins::plugin_health))
         .route("/api/plugins/load", post(api::plugins::load_plugin))
         .route("/api/plugins/rescan", post(api::plugins::rescan_plugins))
-        .route(
-            "/api/plugins/:name",
-            get(api::plugins::get_plugin),
-        )
+        .route("/api/plugins/:name", get(api::plugins::get_plugin))
         .route(
             "/api/plugins/:name/unload",
             post(api::plugins::unload_plugin),

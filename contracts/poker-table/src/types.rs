@@ -63,6 +63,7 @@ pub enum PokerTableError {
     RakeBpsExceedsMax = 36,
     InvalidPlayerCount = 37,
     CannotChangeMinPlayersMidHand = 38,
+    ContractPaused = 39,
 }
 
 #[contracttype]

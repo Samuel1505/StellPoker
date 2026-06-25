@@ -1,0 +1,20 @@
+{
+  "default_max_increase_pct": 5.0,
+  "circuits": {
+    "deal_valid": {
+      "max_acir_opcodes": 16000,
+      "max_backend_opcodes": 32000,
+      "max_increase_pct": 5.0
+    },
+    "reveal_board_valid": {
+      "max_acir_opcodes": 16000,
+      "max_backend_opcodes": 40000,
+      "max_increase_pct": 5.0
+    },
+    "showdown_valid": {
+      "max_acir_opcodes": 150000,
+      "max_backend_opcodes": 290000,
+      "max_increase_pct": 5.0
+    }
+  }
+}

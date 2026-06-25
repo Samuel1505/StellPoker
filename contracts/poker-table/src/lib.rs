@@ -8,6 +8,8 @@ mod game;
 mod game_hub;
 #[cfg(test)]
 mod invariants_test;
+#[cfg(test)]
+mod lifecycle_invariants_test;
 mod pot;
 mod test;
 mod timeout;

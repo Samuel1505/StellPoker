@@ -1,0 +1,20 @@
+[watch]
+paths = [
+  "services/coordinator/src",
+  "services/coordinator/migrations",
+  "services/coordinator/Cargo.toml",
+  "Cargo.toml",
+]
+ignore = [
+  ".tmp",
+  "target",
+]
+
+[run]
+command = "cargo run -p coordinator"
+
+[env]
+COORDINATOR_HOT_RELOAD = "1"
+COORDINATOR_HOT_RELOAD_SNAPSHOT = ".tmp/coordinator-hot-reload.json"
+BIND_ADDR = "127.0.0.1:8080"
+CIRCUIT_DIR = "./circuits"

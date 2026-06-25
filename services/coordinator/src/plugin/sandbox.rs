@@ -34,8 +34,8 @@ pub fn create_sandbox_store<T: 'static>(engine: &Engine, data: T) -> Result<Stor
     let config = SandboxConfig::default();
     let mut store = Store::new(&engine, data);
     store
-        .set_fuel(config.max_fuel)
-        .map_err(|e| format!("failed to set fuel: {}", e))?;
+        .add_fuel(config.max_fuel)
+        .map_err(|e| format!("failed to add fuel: {}", e))?;
     Ok(store)
 }
 

@@ -4,264 +4,110 @@ on:
   push:
     paths:
       - circuits/**
+      - scripts/circuit_constraints.py
+      - .github/workflows/circuit-benchmarks.yml
   pull_request:
     paths:
       - circuits/**
+      - scripts/circuit_constraints.py
+      - .github/workflows/circuit-benchmarks.yml
 
 env:
   NOIR_VERSION: 1.0.0-beta.17
-  BB_VERSION: 0.77.1
-
-  # ── Constraint thresholds (inclusive upper bounds) ─────────────┐
-  # Raise these when circuit changes deliberately increase size.   │
-  # Each variable follows the pattern:                             │
-  #   THRESHOLD_<NAME>_<METRIC>                                     │
-  #                                                                │
-  # Metrics:                                                       │
-  #   ACIR_OPCODES    – number of ACIR opcodes                    │
-  #   BACKEND_OPCODES – UltraHonk gate count                      │
-  # ───────────────────────────────────────────────────────────────┘
-  THRESHOLD_DEAL_VALID_ACIR_OPCODES: 16000
-  THRESHOLD_DEAL_VALID_BACKEND_OPCODES: 32000
-
-  THRESHOLD_REVEAL_BOARD_VALID_ACIR_OPCODES: 16000
-  THRESHOLD_REVEAL_BOARD_VALID_BACKEND_OPCODES: 40000
-
-  THRESHOLD_SHOWDOWN_VALID_ACIR_OPCODES: 150000
-  THRESHOLD_SHOWDOWN_VALID_BACKEND_OPCODES: 290000
 
 jobs:
   benchmarks:
-    name: Constraint & proof benchmarks
+    name: Constraint budgets
     runs-on: ubuntu-latest
-    outputs:
-      summary: ${{ steps.summary.outputs.markdown }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout current ref
+        uses: actions/checkout@v4
+        with:
+          path: current
+          fetch-depth: 0
+
+      - name: Checkout comparison ref
+        uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          path: baseline
+          fetch-depth: 1
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
 
       - name: Install Nargo
+        working-directory: current
         run: |
           curl -L https://raw.githubusercontent.com/noir-lang/noirup/refs/heads/main/install | bash
-          echo "$HOME/.nargo/bin" >> $GITHUB_PATH
-          $HOME/.nargo/bin/noirup -v $NOIR_VERSION
+          echo "$HOME/.nargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.nargo/bin/noirup" -v "$NOIR_VERSION"
 
-      - name: Install jq
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq
-
-      # ── Nargo info: extract metrics ────────────────────────────
-      - name: Run nargo info (deal_valid)
-        id: info_deal_valid
-        working-directory: circuits/deal_valid
+      - name: Install bb
         run: |
-          nargo info --json 2>&1 | tee nargo_info.json
-          echo "raw_output=$(cat nargo_info.json)" >> $GITHUB_OUTPUT
+          curl -fsSL https://raw.githubusercontent.com/AztecProtocol/aztec-packages/refs/heads/next/barretenberg/bbup/install | bash
+          echo "$HOME/.bb" >> "$GITHUB_PATH"
+          "$HOME/.bb/bbup"
 
-      - name: Run nargo info (reveal_board_valid)
-        id: info_reveal_board_valid
-        working-directory: circuits/reveal_board_valid
-        run: |
-          nargo info --json 2>&1 | tee nargo_info.json
-          echo "raw_output=$(cat nargo_info.json)" >> $GITHUB_OUTPUT
+      - name: Compile current circuits
+        working-directory: current
+        run: ./scripts/compile-circuits.sh
 
-      - name: Run nargo info (showdown_valid)
-        id: info_showdown_valid
-        working-directory: circuits/showdown_valid
-        run: |
-          nargo info --json 2>&1 | tee nargo_info.json
-          echo "raw_output=$(cat nargo_info.json)" >> $GITHUB_OUTPUT
+      - name: Collect current constraint metrics
+        working-directory: current
+        run: python3 scripts/circuit_constraints.py --refresh --output-dir reports/circuits-current
 
-      # ── Run bb gates for backend circuit sizes ──────────────
-      - name: Install bb and get backend gate counts
-        id: bb_gates
-        continue-on-error: false
-        run: |
-          set -euo pipefail
-
-          # Install bb via bbup if not already present.
-          if ! command -v bb &>/dev/null && [ ! -x /home/runner/.bb/bb ]; then
-            curl -fsSL https://raw.githubusercontent.com/AztecProtocol/aztec-packages/refs/heads/next/barretenberg/bbup/install | bash
-            echo "/home/runner/.bb" >> $GITHUB_PATH
-            export PATH="/home/runner/.bb:$PATH"
-            bbup
-          fi
-          export PATH="/home/runner/.bb:$PATH"
-
-          declare -a circuits=(deal_valid reveal_board_valid showdown_valid)
-          for circuit in "${circuits[@]}"; do
-            artifact="circuits/${circuit}/target/${circuit}.json"
-            if [ ! -f "$artifact" ]; then
-              echo "::error::Missing compiled artifact for ${circuit} (run nargo compile first)"
-              exit 1
-            fi
-            gates_json=$(bb gates --scheme ultra_honk --bytecode_path "$artifact" 2>/dev/null)
-            echo "${circuit}_gates=${gates_json}" >> $GITHUB_OUTPUT
-            # Persist raw JSON for the parse step
-            echo "$gates_json" > "circuits/${circuit}/bb_gates.json"
-          done
-
-      # ── Parse & validate ───────────────────────────────────────
-      - name: Parse and validate metrics
-        id: parse
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          declare -a circuits=(deal_valid reveal_board_valid showdown_valid)
-          declare -a results=()
-          EXIT_CODE=0
-
-          for circuit in "${circuits[@]}"; do
-            # ACIR opcodes from nargo info: { programs: [{ functions: [{ name: "main", opcodes: N }] }] }
-            info_file="circuits/${circuit}/nargo_info.json"
-            if [ ! -f "$info_file" ]; then
-              echo "::error::Missing nargo_info.json for ${circuit}"
-              EXIT_CODE=1
-              continue
-            fi
-            acir_opcodes=$(jq '.programs[0].functions[] | select(.name=="main") | .opcodes // empty' "$info_file")
-
-            # Backend opcodes from bb gates: { functions: [{ acir_opcodes: N, circuit_size: N }] }
-            gates_file="circuits/${circuit}/bb_gates.json"
-            if [ ! -f "$gates_file" ]; then
-              echo "::error::Missing bb_gates.json for ${circuit}"
-              EXIT_CODE=1
-              continue
-            fi
-            backend_opcodes=$(jq '.functions[0].circuit_size // empty' "$gates_file")
-
-            if [ -z "$acir_opcodes" ]; then
-              echo "::error::Failed to parse acir_opcodes from nargo_info.json for ${circuit}"
-              EXIT_CODE=1
-              continue
-            fi
-            if [ -z "$backend_opcodes" ]; then
-              echo "::error::Failed to parse circuit_size from bb_gates.json for ${circuit}"
-              EXIT_CODE=1
-              continue
-            fi
-
-            # Look up thresholds from env vars.
-            upped=$(echo "$circuit" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
-            threshold_acir_var="THRESHOLD_${upped}_ACIR_OPCODES"
-            threshold_back_var="THRESHOLD_${upped}_BACKEND_OPCODES"
-
-            threshold_acir="${!threshold_acir_var:-0}"
-            threshold_back="${!threshold_back_var:-0}"
-
-            violations=""
-
-            if [ "$acir_opcodes" -gt "$threshold_acir" ]; then
-              violations+=" ACIR_OPCODES(${acir_opcodes}>${threshold_acir})"
-            fi
-            if [ "$backend_opcodes" -gt "$threshold_back" ]; then
-              violations+=" BACKEND_OPCODES(${backend_opcodes}>${threshold_back})"
-            fi
-
-            if [ -n "$violations" ]; then
-              echo "::error::${circuit}: threshold(s) exceeded:${violations}"
-              EXIT_CODE=1
-            fi
-
-            # Emit step outputs for the summary.
-            echo "${circuit}_acir_opcodes=${acir_opcodes}" >> $GITHUB_OUTPUT
-            echo "${circuit}_backend_opcodes=${backend_opcodes}" >> $GITHUB_OUTPUT
-            echo "${circuit}_threshold_acir=${threshold_acir}" >> $GITHUB_OUTPUT
-            echo "${circuit}_threshold_back=${threshold_back}" >> $GITHUB_OUTPUT
-
-            results+=("✓ ${circuit}: ${acir_opcodes} ACIR / ${backend_opcodes} backend")
-          done
-
-          echo "--- Results ---"
-          for r in "${results[@]}"; do echo "$r"; done
-
-          # Build the markdown table for the summary.
-          {
-            echo "table_markdown<<EOF"
-            echo "| Circuit | ACIR Opcodes | Backend Opcodes |"
-            echo "|---------|-------------:|----------------:|"
-            for circuit in "${circuits[@]}"; do
-              info_file="circuits/${circuit}/nargo_info.json"
-              gates_file="circuits/${circuit}/bb_gates.json"
-              a=$(jq '.programs[0].functions[] | select(.name=="main") | .opcodes // "ERR"' "$info_file" 2>/dev/null || echo "ERR")
-              b=$(jq '.functions[0].circuit_size // "ERR"' "$gates_file" 2>/dev/null || echo "ERR")
-              echo "| \`${circuit}\` | ${a} | ${b} |"
-            done
-            echo EOF
-          } >> $GITHUB_OUTPUT
-
-          exit $EXIT_CODE
-
-      # ── Optional: proof-size benchmark with bb ─────────────────
-      - name: Barretenberg proof size (optional)
-        id: bb_info
+      - name: Compile baseline circuits
+        id: baseline_compile
         continue-on-error: true
-        run: |
-          set -euo pipefail
+        working-directory: baseline
+        run: ./scripts/compile-circuits.sh
 
-          export PATH="/home/runner/.bb:$PATH"
-          if ! command -v bb &>/dev/null; then
-            echo "bb not available; skipping proof benchmark"
-            exit 0
+      - name: Collect baseline constraint metrics
+        id: baseline_collect
+        if: steps.baseline_compile.outcome == 'success'
+        continue-on-error: true
+        working-directory: baseline
+        run: python3 ../current/scripts/circuit_constraints.py --repo "$PWD" --refresh --output-dir reports/circuits-baseline
+
+      - name: Compare current against baseline
+        if: steps.baseline_collect.outcome == 'success'
+        working-directory: current
+        run: |
+          python3 scripts/circuit_constraints.py \
+            --baseline ../baseline/reports/circuits-baseline/circuit-constraints.json \
+            --output-dir reports/circuits
+
+      - name: Use budget-only report when no baseline is available
+        if: steps.baseline_collect.outcome != 'success'
+        working-directory: current
+        run: cp -R reports/circuits-current reports/circuits
+
+      - name: Publish step summary
+        if: always()
+        working-directory: current
+        run: |
+          if [ -f reports/circuits/circuit-constraints.md ]; then
+            cat reports/circuits/circuit-constraints.md >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          PROOF_DIR="${RUNNER_TEMP}/proofs"
-          mkdir -p "$PROOF_DIR"
-
-          for circuit in deal_valid reveal_board_valid showdown_valid; do
-            dir="circuits/${circuit}"
-            echo "--- ${circuit} ---"
-
-            artifact="${dir}/target/${circuit}.json"
-            witness="${dir}/target/${circuit}.gz"
-            if [ ! -f "$artifact" ] || [ ! -f "$witness" ]; then
-              echo "  ⚠ artifact or witness missing for ${circuit}; skipping proof"
-              continue
-            fi
-
-            vk_dir="${PROOF_DIR}/${circuit}_vk"
-            proof_dir="${PROOF_DIR}/${circuit}_proof"
-            mkdir -p "$vk_dir" "$proof_dir"
-
-            bb write_vk --scheme ultra_honk -b "$artifact" -o "$vk_dir" 2>&1 || {
-              echo "  ⚠ write_vk failed for ${circuit}"
-              continue
-            }
-
-            bb prove --scheme ultra_honk \
-              -b "$artifact" -w "$witness" -k "${vk_dir}/vk" -o "$proof_dir" 2>&1 || {
-              echo "  ⚠ prove failed for ${circuit}"
-              continue
-            }
-
-            proof_bytes=$(wc -c < "${proof_dir}/proof")
-            pi_bytes=$(wc -c < "${proof_dir}/public_inputs")
-            echo "${circuit}_proof_bytes=${proof_bytes}" >> $GITHUB_OUTPUT
-            echo "  proof: ${proof_bytes} bytes, public_inputs: ${pi_bytes} bytes"
-          done
-
-      # ── Post a summary comment on PRs ───────────────────────────
-      - name: Generate summary
-        id: summary
-        run: |
-          cat <<'SUMM' > $GITHUB_STEP_SUMMARY
-          ## Circuit Benchmark Results
-
-          ${{ steps.parse.outputs.table_markdown }}
-
-          **Thresholds:** see `.github/workflows/circuit-benchmarks.yml` env vars.
-
-          SUMM
+      - name: Upload circuit constraint artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: circuit-constraint-report
+          path: current/reports/circuits
 
       - name: Comment PR
         if: ${{ github.event_name == 'pull_request' && always() }}
         uses: actions/github-script@v7
         with:
           script: |
-            const output = '${{ steps.parse.outputs.table_markdown }}';
-            const body = `## Circuit Benchmark Results\n\n${output}\n\n_Automated constraint check._`;
+            const fs = require('fs');
+            const path = 'current/reports/circuits/circuit-constraints.md';
+            if (!fs.existsSync(path)) return;
+            const body = fs.readFileSync(path, 'utf8');
             github.rest.issues.createComment({
-              issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: body
+              issue_number: context.issue.number,
+              body
             });
