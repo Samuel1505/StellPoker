@@ -2,6 +2,7 @@
 
 pub mod admin;
 mod admin_extended;
+pub mod api_key_admin;
 mod auth;
 pub mod flags;
 mod parsing;

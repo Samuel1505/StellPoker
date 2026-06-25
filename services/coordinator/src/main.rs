@@ -38,12 +38,14 @@ use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 
 mod api;
+mod api_keys;
 mod audit_log;
 mod cors_db;
 mod db;
 mod feature_flags;
 mod hot_reload;
 mod mpc;
+mod mpc_auth_middleware;
 mod plugin;
 mod rate_limit_db;
 #[path = "middleware.rs"]
@@ -604,9 +606,17 @@ async fn main() {
             "/api/admin/migrations/:id/cancel",
             post(api::admin_cancel_migration),
         )
+        // API key management endpoints
+        .route("/api/admin/api-keys", post(api::api_key_admin::create_api_key))
+        .route("/api/admin/api-keys/:node_id", get(api::api_key_admin::list_api_keys))
+        .route("/api/admin/api-keys/:key_id/revoke", post(api::api_key_admin::revoke_api_key))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             metrics_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            mpc_auth_middleware::authenticate_mpc_request,
         ))
         .layer(middleware::from_fn(request_log::log_request))
         .layer(build_cors_layer(state.db_pool.as_deref()).await)
