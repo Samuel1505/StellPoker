@@ -1,3 +1,5 @@
+mod crypto;
+
 //! Stellar Poker MPC Node
 //!
 //! Each node is a participant in the REP3 MPC protocol via TACEO's co-noir.
